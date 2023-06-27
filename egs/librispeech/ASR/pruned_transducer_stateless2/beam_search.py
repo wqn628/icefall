@@ -22,7 +22,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import k2
 import sentencepiece as spm
 import torch
-from model import Transducer
+from torch import nn
 
 from icefall import ContextGraph, ContextState, NgramLm, NgramLmStateCost
 from icefall.decode import Nbest, one_best_decoding
@@ -39,7 +39,7 @@ from icefall.utils import (
 
 
 def fast_beam_search_one_best(
-    model: Transducer,
+    model: nn.Module,
     decoding_graph: k2.Fsa,
     encoder_out: torch.Tensor,
     encoder_out_lens: torch.Tensor,
@@ -47,8 +47,8 @@ def fast_beam_search_one_best(
     max_states: int,
     max_contexts: int,
     temperature: float = 1.0,
-    subtract_ilme: bool = False,
-    ilme_scale: float = 0.1,
+    ilme_scale: float = 0.0,
+    blank_penalty: float = 0.0,
     return_timestamps: bool = False,
 ) -> Union[List[List[int]], DecodingResults]:
     """It limits the maximum number of symbols per frame to 1.
@@ -90,8 +90,8 @@ def fast_beam_search_one_best(
         max_states=max_states,
         max_contexts=max_contexts,
         temperature=temperature,
-        subtract_ilme=subtract_ilme,
         ilme_scale=ilme_scale,
+        blank_penalty=blank_penalty,
     )
 
     best_path = one_best_decoding(lattice)
@@ -103,7 +103,7 @@ def fast_beam_search_one_best(
 
 
 def fast_beam_search_nbest_LG(
-    model: Transducer,
+    model: nn.Module,
     decoding_graph: k2.Fsa,
     encoder_out: torch.Tensor,
     encoder_out_lens: torch.Tensor,
@@ -114,6 +114,8 @@ def fast_beam_search_nbest_LG(
     nbest_scale: float = 0.5,
     use_double_scores: bool = True,
     temperature: float = 1.0,
+    blank_penalty: float = 0.0,
+    ilme_scale: float = 0.0,
     return_timestamps: bool = False,
 ) -> Union[List[List[int]], DecodingResults]:
     """It limits the maximum number of symbols per frame to 1.
@@ -168,6 +170,8 @@ def fast_beam_search_nbest_LG(
         max_states=max_states,
         max_contexts=max_contexts,
         temperature=temperature,
+        blank_penalty=blank_penalty,
+        ilme_scale=ilme_scale,
     )
 
     nbest = Nbest.from_lattice(
@@ -229,7 +233,7 @@ def fast_beam_search_nbest_LG(
 
 
 def fast_beam_search_nbest(
-    model: Transducer,
+    model: nn.Module,
     decoding_graph: k2.Fsa,
     encoder_out: torch.Tensor,
     encoder_out_lens: torch.Tensor,
@@ -240,6 +244,7 @@ def fast_beam_search_nbest(
     nbest_scale: float = 0.5,
     use_double_scores: bool = True,
     temperature: float = 1.0,
+    blank_penalty: float = 0.0,
     return_timestamps: bool = False,
 ) -> Union[List[List[int]], DecodingResults]:
     """It limits the maximum number of symbols per frame to 1.
@@ -293,6 +298,7 @@ def fast_beam_search_nbest(
         beam=beam,
         max_states=max_states,
         max_contexts=max_contexts,
+        blank_penalty=blank_penalty,
         temperature=temperature,
     )
 
@@ -319,7 +325,7 @@ def fast_beam_search_nbest(
 
 
 def fast_beam_search_nbest_oracle(
-    model: Transducer,
+    model: nn.Module,
     decoding_graph: k2.Fsa,
     encoder_out: torch.Tensor,
     encoder_out_lens: torch.Tensor,
@@ -331,6 +337,7 @@ def fast_beam_search_nbest_oracle(
     use_double_scores: bool = True,
     nbest_scale: float = 0.5,
     temperature: float = 1.0,
+    blank_penalty: float = 0.0,
     return_timestamps: bool = False,
 ) -> Union[List[List[int]], DecodingResults]:
     """It limits the maximum number of symbols per frame to 1.
@@ -389,6 +396,7 @@ def fast_beam_search_nbest_oracle(
         max_states=max_states,
         max_contexts=max_contexts,
         temperature=temperature,
+        blank_penalty=blank_penalty,
     )
 
     nbest = Nbest.from_lattice(
@@ -424,7 +432,7 @@ def fast_beam_search_nbest_oracle(
 
 
 def fast_beam_search(
-    model: Transducer,
+    model: nn.Module,
     decoding_graph: k2.Fsa,
     encoder_out: torch.Tensor,
     encoder_out_lens: torch.Tensor,
@@ -432,8 +440,8 @@ def fast_beam_search(
     max_states: int,
     max_contexts: int,
     temperature: float = 1.0,
-    subtract_ilme: bool = False,
-    ilme_scale: float = 0.1,
+    ilme_scale: float = 0.0,
+    blank_penalty: float = 0.0,
 ) -> k2.Fsa:
     """It limits the maximum number of symbols per frame to 1.
 
@@ -503,8 +511,13 @@ def fast_beam_search(
             project_input=False,
         )
         logits = logits.squeeze(1).squeeze(1)
+
+        if blank_penalty != 0:
+            logits[:, 0] -= blank_penalty
+
         log_probs = (logits / temperature).log_softmax(dim=-1)
-        if subtract_ilme:
+
+        if ilme_scale != 0:
             ilme_logits = model.joiner(
                 torch.zeros_like(
                     current_encoder_out, device=current_encoder_out.device
@@ -513,8 +526,11 @@ def fast_beam_search(
                 project_input=False,
             )
             ilme_logits = ilme_logits.squeeze(1).squeeze(1)
+            if blank_penalty != 0:
+                ilme_logits[:, 0] -= blank_penalty
             ilme_log_probs = (ilme_logits / temperature).log_softmax(dim=-1)
             log_probs -= ilme_scale * ilme_log_probs
+
         decoding_streams.advance(log_probs)
     decoding_streams.terminate_and_flush_to_streams()
     lattice = decoding_streams.format_output(encoder_out_lens.tolist())
@@ -523,9 +539,10 @@ def fast_beam_search(
 
 
 def greedy_search(
-    model: Transducer,
+    model: nn.Module,
     encoder_out: torch.Tensor,
     max_sym_per_frame: int,
+    blank_penalty: float = 0.0,
     return_timestamps: bool = False,
 ) -> Union[List[int], DecodingResults]:
     """Greedy search for a single utterance.
@@ -595,6 +612,9 @@ def greedy_search(
         )
         # logits is (1, 1, 1, vocab_size)
 
+        if blank_penalty != 0:
+            logits[:, :, :, 0] -= blank_penalty
+
         y = logits.argmax().item()
         if y not in (blank_id, unk_id):
             hyp.append(y)
@@ -623,9 +643,10 @@ def greedy_search(
 
 
 def greedy_search_batch(
-    model: Transducer,
+    model: nn.Module,
     encoder_out: torch.Tensor,
     encoder_out_lens: torch.Tensor,
+    blank_penalty: float = 0,
     return_timestamps: bool = False,
 ) -> Union[List[List[int]], DecodingResults]:
     """Greedy search in batch mode. It hardcodes --max-sym-per-frame=1.
@@ -703,6 +724,10 @@ def greedy_search_batch(
 
         logits = logits.squeeze(1).squeeze(1)  # (batch_size, vocab_size)
         assert logits.ndim == 2, logits.shape
+
+        if blank_penalty != 0:
+            logits[:, 0] -= blank_penalty
+
         y = logits.argmax(dim=1).tolist()
         emitted = False
         for i, v in enumerate(y):
@@ -917,12 +942,13 @@ def get_hyps_shape(hyps: List[HypothesisList]) -> k2.RaggedShape:
 
 
 def modified_beam_search(
-    model: Transducer,
+    model: nn.Module,
     encoder_out: torch.Tensor,
     encoder_out_lens: torch.Tensor,
     context_graph: Optional[ContextGraph] = None,
     beam: int = 4,
     temperature: float = 1.0,
+    blank_penalty: float = 0.0,
     return_timestamps: bool = False,
 ) -> Union[List[List[int]], DecodingResults]:
     """Beam search in batch mode with --max-sym-per-frame=1 being hardcoded.
@@ -1028,6 +1054,9 @@ def modified_beam_search(
 
         logits = logits.squeeze(1).squeeze(1)  # (num_hyps, vocab_size)
 
+        if blank_penalty != 0:
+            logits[:, 0] -= blank_penalty
+
         log_probs = (logits / temperature).log_softmax(dim=-1)  # (num_hyps, vocab_size)
 
         log_probs.add_(ys_log_probs)
@@ -1119,7 +1148,7 @@ def modified_beam_search(
 
 
 def modified_beam_search_lm_rescore(
-    model: Transducer,
+    model: nn.Module,
     encoder_out: torch.Tensor,
     encoder_out_lens: torch.Tensor,
     LM: LmScorer,
@@ -1317,7 +1346,7 @@ def modified_beam_search_lm_rescore(
 
 
 def modified_beam_search_lm_rescore_LODR(
-    model: Transducer,
+    model: nn.Module,
     encoder_out: torch.Tensor,
     encoder_out_lens: torch.Tensor,
     LM: LmScorer,
@@ -1533,7 +1562,7 @@ def modified_beam_search_lm_rescore_LODR(
 
 
 def _deprecated_modified_beam_search(
-    model: Transducer,
+    model: nn.Module,
     encoder_out: torch.Tensor,
     beam: int = 4,
     return_timestamps: bool = False,
@@ -1658,10 +1687,11 @@ def _deprecated_modified_beam_search(
 
 
 def beam_search(
-    model: Transducer,
+    model: nn.Module,
     encoder_out: torch.Tensor,
     beam: int = 4,
     temperature: float = 1.0,
+    blank_penalty: float = 0.0,
     return_timestamps: bool = False,
 ) -> Union[List[int], DecodingResults]:
     """
@@ -1758,6 +1788,9 @@ def beam_search(
                     project_input=False,
                 )
 
+                if blank_penalty != 0:
+                    logits[:, :, :, 0] -= blank_penalty
+
                 # TODO(fangjun): Scale the blank posterior
                 log_prob = (logits / temperature).log_softmax(dim=-1)
                 # log_prob is (1, 1, 1, vocab_size)
@@ -1818,7 +1851,7 @@ def beam_search(
 
 
 def fast_beam_search_with_nbest_rescoring(
-    model: Transducer,
+    model: nn.Module,
     decoding_graph: k2.Fsa,
     encoder_out: torch.Tensor,
     encoder_out_lens: torch.Tensor,
@@ -1978,7 +2011,7 @@ def fast_beam_search_with_nbest_rescoring(
 
 
 def fast_beam_search_with_nbest_rnn_rescoring(
-    model: Transducer,
+    model: nn.Module,
     decoding_graph: k2.Fsa,
     encoder_out: torch.Tensor,
     encoder_out_lens: torch.Tensor,
@@ -2169,7 +2202,7 @@ def fast_beam_search_with_nbest_rnn_rescoring(
 
 
 def modified_beam_search_ngram_rescoring(
-    model: Transducer,
+    model: nn.Module,
     encoder_out: torch.Tensor,
     encoder_out_lens: torch.Tensor,
     ngram_lm: NgramLm,
@@ -2333,7 +2366,7 @@ def modified_beam_search_ngram_rescoring(
 
 
 def modified_beam_search_LODR(
-    model: Transducer,
+    model: nn.Module,
     encoder_out: torch.Tensor,
     encoder_out_lens: torch.Tensor,
     LODR_lm: NgramLm,
@@ -2604,7 +2637,7 @@ def modified_beam_search_LODR(
 
 
 def modified_beam_search_lm_shallow_fusion(
-    model: Transducer,
+    model: nn.Module,
     encoder_out: torch.Tensor,
     encoder_out_lens: torch.Tensor,
     LM: LmScorer,

@@ -10,7 +10,7 @@ log() {
 
 cd egs/librispeech/ASR
 
-repo_url=https://huggingface.co/Zengwei/icefall-asr-librispeech-streaming-zipformer-2023-05-17
+repo_url=https://huggingface.co/Zengwei/icefall-asr-librispeech-zipformer-transducer-ctc-2023-06-13
 
 log "Downloading pre-trained model from $repo_url"
 git lfs install
@@ -24,7 +24,12 @@ ls -lh $repo/test_wavs/*.wav
 pushd $repo/exp
 git lfs pull --include "data/lang_bpe_500/bpe.model"
 git lfs pull --include "data/lang_bpe_500/tokens.txt"
-git lfs pull --include "exp/jit_script_chunk_16_left_128.pt"
+git lfs pull --include "data/lang_bpe_500/HLG.pt"
+git lfs pull --include "data/lang_bpe_500/L.pt"
+git lfs pull --include "data/lang_bpe_500/LG.pt"
+git lfs pull --include "data/lang_bpe_500/Linv.pt"
+git lfs pull --include "data/lm/G_4_gram.pt"
+git lfs pull --include "exp/jit_script.pt"
 git lfs pull --include "exp/pretrained.pt"
 ln -s pretrained.pt epoch-99.pt
 ls -lh *.pt
@@ -33,11 +38,10 @@ popd
 log "Export to torchscript model"
 ./zipformer/export.py \
   --exp-dir $repo/exp \
+  --use-transducer 1 \
+  --use-ctc 1 \
   --use-averaged-model false \
   --tokens $repo/data/lang_bpe_500/tokens.txt \
-  --causal 1 \
-  --chunk-size 16 \
-  --left-context-frames 128 \
   --epoch 99 \
   --avg 1 \
   --jit 1
@@ -46,22 +50,33 @@ ls -lh $repo/exp/*.pt
 
 log "Decode with models exported by torch.jit.script()"
 
-./zipformer/jit_pretrained_streaming.py \
-  --tokens $repo/data/lang_bpe_500/tokens.txt \
-  --nn-model-filename $repo/exp/jit_script_chunk_16_left_128.pt \
-  $repo/test_wavs/1089-134686-0001.wav
+for method in ctc-decoding 1best; do
+  ./zipformer/jit_pretrained_ctc.py \
+    --tokens $repo/data/lang_bpe_500/tokens.txt \
+    --model-filename $repo/exp/jit_script.pt \
+    --HLG $repo/data/lang_bpe_500/HLG.pt \
+    --words-file $repo/data/lang_bpe_500/words.txt  \
+    --G $repo/data/lm/G_4_gram.pt \
+    --method $method \
+    --sample-rate 16000 \
+    $repo/test_wavs/1089-134686-0001.wav \
+    $repo/test_wavs/1221-135766-0001.wav \
+    $repo/test_wavs/1221-135766-0002.wav
+done
 
-for method in greedy_search modified_beam_search fast_beam_search; do
+for method in ctc-decoding 1best; do
   log "$method"
 
-  ./zipformer/pretrained.py \
-    --causal 1 \
-    --chunk-size 16 \
-    --left-context-frames 128 \
+  ./zipformer/pretrained_ctc.py \
+    --use-transducer 1 \
+    --use-ctc 1 \
     --method $method \
-    --beam-size 4 \
     --checkpoint $repo/exp/pretrained.pt \
     --tokens $repo/data/lang_bpe_500/tokens.txt \
+    --HLG $repo/data/lang_bpe_500/HLG.pt \
+    --G $repo/data/lm/G_4_gram.pt \
+    --words-file $repo/data/lang_bpe_500/words.txt  \
+    --sample-rate 16000 \
     $repo/test_wavs/1089-134686-0001.wav \
     $repo/test_wavs/1221-135766-0001.wav \
     $repo/test_wavs/1221-135766-0002.wav
@@ -82,29 +97,15 @@ if [[ x"${GITHUB_EVENT_NAME}" == x"schedule" || x"${GITHUB_EVENT_LABEL_NAME}" ==
   # use a small value for decoding with CPU
   max_duration=100
 
-  for method in greedy_search fast_beam_search modified_beam_search; do
-    log "Simulated streaming decoding with $method"
+  for method in ctc-decoding 1best; do
+    log "Decoding with $method"
 
-    ./zipformer/decode.py \
-      --causal 1 \
-      --chunk-size 16 \
-      --left-context-frames 128 \
+    ./zipformer/ctc_decode.py \
+      --use-transducer 1 \
+      --use-ctc 1 \
       --decoding-method $method \
-      --epoch 999 \
-      --avg 1 \
-      --use-averaged-model 0 \
-      --max-duration $max_duration \
-      --exp-dir zipformer/exp
-  done
-
-  for method in greedy_search fast_beam_search modified_beam_search; do
-    log "Chunk-wise streaming decoding with $method"
-
-    ./zipformer/streaming_decode.py \
-      --causal 1 \
-      --chunk-size 16 \
-      --left-context-frames 128 \
-      --decoding-method $method \
+      --nbest-scale 1.0 \
+      --hlg-scale 0.6 \
       --epoch 999 \
       --avg 1 \
       --use-averaged-model 0 \
